@@ -26,7 +26,7 @@ img_tensor = transforms.Compose([
 data_sample = SegDataSample()
 img_meta = {
     'img_path': img_path,
-    'ori_shape': img.size
+    'ori_shape': img.size[::-1] # H, W
 }
 data_sample.set_metainfo(img_meta)
 
