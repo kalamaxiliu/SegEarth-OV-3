@@ -49,6 +49,12 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                  dinov3_path='weights/dinov3/model.safetensors',
                  co_occurrence_path='data/co_occurrence_inria.json',
                  gcm_alpha=1.0, # <--- [NEW] 默认强度 1.0
+                 use_adaptive_alpha=False,
+                 alpha_max=1.0,
+                 gcm_temperature=0.1,
+                 use_local_prior=False,
+                 local_prior_lambda=0.5,
+                 local_prior_use_similarity=True,
                  **kwargs):
         super().__init__()
         
@@ -67,8 +73,19 @@ class SegEarthOV3Segmentation(BaseSegmentor):
             self.gcm_alpha = kwargs['gcm_alpha']
         else:
             self.gcm_alpha = gcm_alpha
+
+        self.use_adaptive_alpha = use_adaptive_alpha
+        self.alpha_max = alpha_max
+        self.gcm_temperature = gcm_temperature
+        self.use_local_prior = use_local_prior
+        self.local_prior_lambda = local_prior_lambda
+        self.local_prior_use_similarity = local_prior_use_similarity
         
         print(f"[SegEarth-OV3] Global Prior Strength (Alpha): {self.gcm_alpha}")
+        if self.use_adaptive_alpha:
+            print(f"[SegEarth-OV3] Adaptive Alpha ENABLED (alpha_max={self.alpha_max})")
+        if self.use_local_prior:
+            print(f"[SegEarth-OV3] Local Prior ENABLED (lambda={self.local_prior_lambda}, use_similarity={self.local_prior_use_similarity})")
 
         # 3. SAM3
         print("Initializing SAM3...")
@@ -103,7 +120,8 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                 device=device, 
                 prototype_path=prototype_path,
                 dinov3_path=dinov3_path,
-                co_occurrence_path=co_occurrence_path 
+                co_occurrence_path=co_occurrence_path,
+                temperature=gcm_temperature
             )
         else:
             self.gcm = None
@@ -112,7 +130,67 @@ class SegEarthOV3Segmentation(BaseSegmentor):
             else:
                 print("Global Context Modulator DISABLED.")
 
-    def _inference_single_view(self, image, global_priors=None):
+    def _compute_alpha(self, scene_info):
+        if not self.use_adaptive_alpha or scene_info is None:
+            return self.gcm_alpha
+
+        num_scenes = scene_info.get("num_scenes", 0)
+        entropy = scene_info.get("entropy")
+        if entropy is None or num_scenes <= 1:
+            return self.gcm_alpha
+
+        max_entropy = torch.log(torch.tensor(float(num_scenes), device=entropy.device))
+        normalized = torch.clamp(entropy / (max_entropy + 1e-8), 0.0, 1.0)
+        alpha = self.alpha_max * (1.0 - normalized)
+        return float(alpha)
+
+    def _build_prior_bundle(self, image):
+        if self.gcm is None:
+            return None
+        priors, feat, scene_info = self.gcm.get_global_prior(
+            image, self.query_words, return_scene_info=True
+        )
+        alpha = self._compute_alpha(scene_info)
+        return {
+            "priors": priors,
+            "feat": feat,
+            "alpha": alpha,
+            "scene_info": scene_info
+        }
+
+    def _mix_prior_bundles(self, global_bundle, local_bundle):
+        if global_bundle is None:
+            return local_bundle
+        if local_bundle is None:
+            return global_bundle
+
+        lambda_global = self.local_prior_lambda
+        if (
+            self.local_prior_use_similarity
+            and global_bundle.get("feat") is not None
+            and local_bundle.get("feat") is not None
+        ):
+            sim = F.cosine_similarity(global_bundle["feat"], local_bundle["feat"]).clamp(-1.0, 1.0)
+            lambda_global = float((sim + 1.0) / 2.0)
+
+        mixed_priors = {}
+        for query_word in self.query_words:
+            global_factor = global_bundle["priors"].get(query_word, 1.0)
+            local_factor = local_bundle["priors"].get(query_word, 1.0)
+            mixed_priors[query_word] = lambda_global * global_factor + (1.0 - lambda_global) * local_factor
+
+        mixed_alpha = (
+            lambda_global * global_bundle.get("alpha", self.gcm_alpha)
+            + (1.0 - lambda_global) * local_bundle.get("alpha", self.gcm_alpha)
+        )
+        return {
+            "priors": mixed_priors,
+            "feat": global_bundle.get("feat"),
+            "alpha": mixed_alpha,
+            "scene_info": global_bundle.get("scene_info")
+        }
+
+    def _inference_single_view(self, image, prior_bundle=None):
         w, h = image.size
         seg_logits = torch.zeros((self.num_queries, h, w), device=self.device)
 
@@ -148,28 +226,28 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                 if self.use_presence_score:
                     presence = inference_state["presence_score"]
                     
-                    if global_priors is not None and query_word in global_priors:
+                    if prior_bundle is not None and query_word in prior_bundle["priors"]:
                         # 核心修改：引入 Alpha 指数调节
-                        raw_factor = global_priors[query_word]
+                        raw_factor = prior_bundle["priors"][query_word]
                         
                         # Apply Alpha: factor ^ alpha
                         # 如果 alpha > 1，会放大 factor 的效果 (e.g. 0.9 -> 0.81, 1.1 -> 1.21)
                         # 如果 alpha < 1，会平滑 factor 的效果
-                        tuned_factor = raw_factor ** self.gcm_alpha
+                        tuned_factor = raw_factor ** prior_bundle["alpha"]
                         
                         if not hasattr(self, "_debug_printed"):
-                             print(f"\n[GCM LIVE] '{query_word}': Raw={raw_factor:.4f} -> Tuned(alpha={self.gcm_alpha})={tuned_factor:.4f}")
+                            print(f"\n[GCM LIVE] '{query_word}': Raw={raw_factor:.4f} -> Tuned(alpha={prior_bundle['alpha']:.4f})={tuned_factor:.4f}")
                              
                         presence = presence * tuned_factor
                         
                     seg_logits[query_idx] = seg_logits[query_idx] * presence
             
-            if not hasattr(self, "_debug_printed") and global_priors is not None:
+            if not hasattr(self, "_debug_printed") and prior_bundle is not None:
                 self._debug_printed = True
                 
         return seg_logits
 
-    def slide_inference(self, image, stride, crop_size, global_priors=None):
+    def slide_inference(self, image, stride, crop_size, global_bundle=None):
         w_img, h_img = image.size
         if isinstance(stride, int): stride = (stride, stride)
         if isinstance(crop_size, int): crop_size = (crop_size, crop_size)
@@ -188,7 +266,12 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                 y1 = max(y2 - h_crop, 0)
                 x1 = max(x2 - w_crop, 0)
                 crop_img = image.crop((x1, y1, x2, y2))
-                crop_seg_logit = self._inference_single_view(crop_img, global_priors=global_priors)
+                if self.use_local_prior and self.gcm is not None:
+                    local_bundle = self._build_prior_bundle(crop_img)
+                    prior_bundle = self._mix_prior_bundles(global_bundle, local_bundle)
+                else:
+                    prior_bundle = global_bundle
+                crop_seg_logit = self._inference_single_view(crop_img, prior_bundle=prior_bundle)
                 preds[:, y1:y2, x1:x2] += crop_seg_logit
                 count_mat[:, y1:y2, x1:x2] += 1
         assert (count_mat == 0).sum() == 0, "Error: Sparse sliding window coverage."
@@ -207,9 +290,9 @@ class SegEarthOV3Segmentation(BaseSegmentor):
             ori_shape = meta['ori_shape']
 
             # Step 1: Global Prior
-            global_priors = None
+            global_bundle = None
             if self.gcm is not None:
-                global_priors, _ = self.gcm.get_global_prior(image, self.query_words)
+                global_bundle = self._build_prior_bundle(image)
             
             # Step 2: Inference
             should_slide = False
@@ -223,11 +306,11 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                 crop_w = self.slide_crop[1] if isinstance(self.slide_crop, (list, tuple)) else self.slide_crop
                 
                 if image.size[0] > crop_w or image.size[1] > crop_h:
-                    seg_logits = self.slide_inference(image, self.slide_stride, self.slide_crop, global_priors=global_priors)
+                    seg_logits = self.slide_inference(image, self.slide_stride, self.slide_crop, global_bundle=global_bundle)
                 else:
-                    seg_logits = self._inference_single_view(image, global_priors=global_priors)
+                    seg_logits = self._inference_single_view(image, prior_bundle=global_bundle)
             else:
-                seg_logits = self._inference_single_view(image, global_priors=global_priors)
+                seg_logits = self._inference_single_view(image, prior_bundle=global_bundle)
 
             # Resize
             if seg_logits.shape[-2:] != ori_shape:
