@@ -12,7 +12,7 @@ import custom_datasets
 def parse_args():
     parser = argparse.ArgumentParser(
         description='CorrCLIP evaluation with MMSeg')
-    parser.add_argument('config', default='./configs/cfg_inria.py')
+    parser.add_argument('config', default='./configs/cfg_loveda.py')
     parser.add_argument(
         '--show', action='store_true', help='show prediction results')
     parser.add_argument(
@@ -23,19 +23,6 @@ def parse_args():
         '--out',
         type=str,
         help='The directory to save output prediction for offline evaluation')
-    
-    # === 新增：方便做消融实验的参数 ===
-    parser.add_argument(
-        '--no-global', 
-        action='store_true', 
-        help='Disable Global Context Modulator (for baseline comparison)')
-    parser.add_argument(
-        '--prototype-path',
-        type=str,
-        default=None,
-        help='Override path to scene prototypes')
-    # ==================================
-
     parser.add_argument(
         '--cfg-options',
         nargs='+',
@@ -51,7 +38,9 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    
+    # When using PyTorch version >= 2.0.0, the `torch.distributed.launch`
+    # will pass the `--local-rank` parameter to `tools/train.py` instead
+    # of `--local_rank`.
     parser.add_argument('--local_rank', '--local-rank', type=int, default=0)
     args = parser.parse_args()
     if 'LOCAL_RANK' not in os.environ:
@@ -74,19 +63,15 @@ def append_experiment_result(file_path, experiment_data):
         sheet['C1'] = 'aAcc'
         sheet['D1'] = 'mIoU'
         sheet['E1'] = 'mAcc'
-        # 新增一列记录是否开启了 Global Prior
-        sheet['F1'] = 'GlobalPrior' 
 
     last_row = sheet.max_row
 
     for index, result in enumerate(experiment_data, start=1):
-        sheet.cell(row=last_row + index, column=1, value=result.get('Model', 'N/A'))
-        sheet.cell(row=last_row + index, column=2, value=result.get('Dataset', 'N/A'))
-        sheet.cell(row=last_row + index, column=3, value=result.get('aAcc', 0))
-        sheet.cell(row=last_row + index, column=4, value=result.get('mIoU', 0))
-        sheet.cell(row=last_row + index, column=5, value=result.get('mAcc', 0))
-        # 记录实验配置
-        sheet.cell(row=last_row + index, column=6, value=result.get('GlobalPrior', 'Unknown'))
+        sheet.cell(row=last_row + index, column=1, value=result['Model'])
+        sheet.cell(row=last_row + index, column=2, value=result['Dataset'])
+        sheet.cell(row=last_row + index, column=3, value=result['aAcc'])
+        sheet.cell(row=last_row + index, column=4, value=result['mIoU'])
+        sheet.cell(row=last_row + index, column=5, value=result['mAcc'])
 
     workbook.save(file_path)
 
@@ -99,7 +84,7 @@ def trigger_visualization_hook(cfg, args):
         visualization_hook['draw'] = True
         if args.show:
             visualization_hook['show'] = True
-            # visualization_hook['wait_time'] = args.wait_time # 原代码 args 没有 wait_time，如果你需要可以加
+            visualization_hook['wait_time'] = args.wait_time
         if args.show_dir:
             visualizer = cfg.visualizer
             visualizer['save_dir'] = args.show_dir
@@ -117,25 +102,12 @@ def main():
     print(os.getcwd())
     cfg = Config.fromfile(args.config)
     cfg.launcher = args.launcher
-    
-    # === 关键修改：将命令行参数注入 Config ===
-    # 这样你可以在不改 config 文件的情况下快速跑 Baseline vs Ours
-    if args.no_global:
-        print("[Eval] Manually disabling Global Context Modulator via command line.")
-        cfg.model.use_global_prior = False
-    
-    if args.prototype_path:
-        print(f"[Eval] Overriding prototype path to: {args.prototype_path}")
-        cfg.model.prototype_path = args.prototype_path
-    # =========================================
-
     # add output_dir in metric
     if args.out is not None:
         cfg.test_evaluator['output_dir'] = args.out
         cfg.test_evaluator['keep_results'] = True
     if args.cfg_options is not None:
         cfg.merge_from_dict(args.cfg_options)
-        
     cfg.work_dir = osp.join('./work_dirs',
                             osp.splitext(osp.basename(args.config))[0])
 
@@ -143,14 +115,8 @@ def main():
     runner = Runner.from_cfg(cfg)
     results = runner.test()
 
-    # 在结果中记录当前状态，方便 Excel 记录
-    use_gcm = getattr(cfg.model, 'use_global_prior', False)
-    
-    results.update({
-        'Model': cfg.model.type if hasattr(cfg.model, 'type') else 'Unknown', # 这里 model_type 可能不存在，用 type 更稳
-        'Dataset': cfg.dataset_type if hasattr(cfg, 'dataset_type') else 'Unknown',
-        'GlobalPrior': 'Yes' if use_gcm else 'No'
-    })
+    results.update({'Model': cfg.model.model_type,
+                    'Dataset': cfg.dataset_type})
 
     if runner.rank == 0:
         append_experiment_result('results.xlsx', [results])

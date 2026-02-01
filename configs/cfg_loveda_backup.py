@@ -2,21 +2,14 @@ _base_ = './base_config.py'
 
 # model settings
 model = dict(
-    type='SegEarthOV3Segmentation', # 确保类型正确，虽然base里可能有了，但写上也无妨
     classname_path='./configs/cls_loveda.txt',
     confidence_threshold=0.5,
     prob_thd=0.5,
-    
-    gcm_alpha=3.0,
-    # 强制覆盖 python 代码里的默认值
-    dinov3_path='weights/dinov3/model.safetensors', 
-    
-    # 确保原型路径也是对的
-    prototype_path='weights/loveda_prototypes.pkl',
-    co_occurrence_path='data/co_occurrence_loveda.json',
 )
 
 # dataset settings
+# Category labels: background – 1, building – 2, road – 3, water – 4, barren – 5,forest – 6, agriculture – 7. 
+# And the no-data regions were assigned 0 which should be ignored. 
 dataset_type = 'LoveDADataset'
 data_root = 'data/LoveDA'
 

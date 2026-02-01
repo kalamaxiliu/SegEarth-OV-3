@@ -8,7 +8,20 @@ from typing import List, Optional
 import torch
 import torch.nn as nn
 
-from torch.nn.attention import sdpa_kernel, SDPBackend
+# from torch.nn.attention import sdpa_kernel, SDPBackend  <-- 注释掉这行
+
+# === 添加下面的兼容代码 ===
+import contextlib
+
+@contextlib.contextmanager
+def sdpa_kernel(*args, **kwargs):
+    yield
+
+class SDPBackend:
+    FLASH_ATTENTION = 0
+    EFFICIENT_ATTENTION = 1
+    MATH = 2
+# ========================
 
 from .act_ckpt_utils import activation_ckpt_wrapper
 from .necks import Sam3DualViTDetNeck

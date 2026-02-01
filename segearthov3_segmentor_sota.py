@@ -45,32 +45,15 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                  use_presence_score=True,
                  use_transformer_decoder=True,
                  use_global_prior=True, 
-                 prototype_path='weights/inria_prototypes.pkl',
+                 prototype_path='weights/scene_prototypes.pkl',
                  dinov3_path='weights/dinov3/model.safetensors',
-                 co_occurrence_path='data/co_occurrence_inria.json',
-                 gcm_alpha=1.0, # <--- [NEW] 默认强度 1.0
+                 co_occurrence_path='data/co_occurrence.json', # <--- 确保这里有默认值
                  **kwargs):
         super().__init__()
         
         self.device = device
-
-        # === 1. 自动读取配置中的 test_cfg 参数 ===
-        if 'test_cfg' in kwargs and kwargs['test_cfg'] is not None:
-            test_cfg = kwargs['test_cfg']
-            if test_cfg.get('mode') == 'slide':
-                slide_crop = test_cfg.get('crop_size', slide_crop)
-                slide_stride = test_cfg.get('stride', slide_stride)
-                print(f"[SegEarth-OV3] 自动启用滑动窗口模式: Crop={slide_crop}, Stride={slide_stride}")
         
-        # === 2. 允许从 Config 的 kwargs 里覆盖 gcm_alpha ===
-        if 'gcm_alpha' in kwargs:
-            self.gcm_alpha = kwargs['gcm_alpha']
-        else:
-            self.gcm_alpha = gcm_alpha
-        
-        print(f"[SegEarth-OV3] Global Prior Strength (Alpha): {self.gcm_alpha}")
-
-        # 3. SAM3
+        # 1. SAM3
         print("Initializing SAM3...")
         model = build_sam3_image_model(
             bpe_path=f"./sam3/assets/bpe_simple_vocab_16e6.txt.gz", 
@@ -79,13 +62,13 @@ class SegEarthOV3Segmentation(BaseSegmentor):
         )
         self.processor = Sam3Processor(model, confidence_threshold=confidence_threshold, device=device)
         
-        # 4. Class Names
+        # 2. Class Names
         self.query_words, self.query_idx = get_cls_idx(classname_path)
         self.num_cls = max(self.query_idx) + 1
         self.num_queries = len(self.query_idx)
         self.query_idx = torch.Tensor(self.query_idx).to(torch.int64).to(device)
 
-        # 5. Params
+        # 3. Params
         self.prob_thd = prob_thd
         self.bg_idx = bg_idx
         self.slide_stride = slide_stride
@@ -95,7 +78,7 @@ class SegEarthOV3Segmentation(BaseSegmentor):
         self.use_presence_score = use_presence_score
         self.use_transformer_decoder = use_transformer_decoder
         
-        # 6. GCM
+        # 4. GCM
         self.use_global_prior = use_global_prior
         if self.use_global_prior and HAS_GCM:
             print("Initializing Global Context Modulator...")
@@ -103,7 +86,7 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                 device=device, 
                 prototype_path=prototype_path,
                 dinov3_path=dinov3_path,
-                co_occurrence_path=co_occurrence_path 
+                co_occurrence_path=co_occurrence_path # <--- 传入路径
             )
         else:
             self.gcm = None
@@ -149,18 +132,14 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                     presence = inference_state["presence_score"]
                     
                     if global_priors is not None and query_word in global_priors:
-                        # 核心修改：引入 Alpha 指数调节
-                        raw_factor = global_priors[query_word]
+                        g_prior_score = global_priors[query_word]
                         
-                        # Apply Alpha: factor ^ alpha
-                        # 如果 alpha > 1，会放大 factor 的效果 (e.g. 0.9 -> 0.81, 1.1 -> 1.21)
-                        # 如果 alpha < 1，会平滑 factor 的效果
-                        tuned_factor = raw_factor ** self.gcm_alpha
-                        
+                        # [DEBUG PRINT]
+                        # 这是一个只在第一次触发的 print，防止刷屏，但能证明它在工作
                         if not hasattr(self, "_debug_printed"):
-                             print(f"\n[GCM LIVE] '{query_word}': Raw={raw_factor:.4f} -> Tuned(alpha={self.gcm_alpha})={tuned_factor:.4f}")
+                             print(f"\n[GCM LIVE] Applying prior for '{query_word}': Factor={g_prior_score}")
                              
-                        presence = presence * tuned_factor
+                        presence = presence * g_prior_score
                         
                     seg_logits[query_idx] = seg_logits[query_idx] * presence
             
@@ -212,20 +191,8 @@ class SegEarthOV3Segmentation(BaseSegmentor):
                 global_priors, _ = self.gcm.get_global_prior(image, self.query_words)
             
             # Step 2: Inference
-            should_slide = False
-            if isinstance(self.slide_crop, (list, tuple)):
-                should_slide = all(c > 0 for c in self.slide_crop)
-            elif isinstance(self.slide_crop, int):
-                should_slide = self.slide_crop > 0
-            
-            if should_slide:
-                crop_h = self.slide_crop[0] if isinstance(self.slide_crop, (list, tuple)) else self.slide_crop
-                crop_w = self.slide_crop[1] if isinstance(self.slide_crop, (list, tuple)) else self.slide_crop
-                
-                if image.size[0] > crop_w or image.size[1] > crop_h:
-                    seg_logits = self.slide_inference(image, self.slide_stride, self.slide_crop, global_priors=global_priors)
-                else:
-                    seg_logits = self._inference_single_view(image, global_priors=global_priors)
+            if self.slide_crop > 0 and (self.slide_crop < image.size[0] or self.slide_crop < image.size[1]):
+                seg_logits = self.slide_inference(image, self.slide_stride, self.slide_crop, global_priors=global_priors)
             else:
                 seg_logits = self._inference_single_view(image, global_priors=global_priors)
 

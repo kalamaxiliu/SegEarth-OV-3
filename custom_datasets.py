@@ -514,3 +514,28 @@ class WaterDataset(BaseSegDataset):
             seg_map_suffix=seg_map_suffix,
             reduce_zero_label=reduce_zero_label,
             **kwargs)
+
+
+
+# 修改后
+@DATASETS.register_module()
+class SegEarthPotsdamDataset(BaseSegDataset):  # <--- 改这里
+    """Potsdam dataset.
+    ISPRS 2D Semantic Labeling Challenge.
+    """
+    METAINFO = dict(
+        classes=('impervious_surface', 'building', 'low_vegetation', 'tree',
+                 'car', 'clutter'),
+        palette=[[255, 255, 255], [0, 0, 255], [0, 255, 255], [0, 255, 0],
+                 [255, 255, 0], [255, 0, 0]])
+
+    def __init__(self,
+                 img_suffix='.tif',
+                 seg_map_suffix='.png',
+                 reduce_zero_label=False,
+                 **kwargs) -> None:
+        super().__init__(
+            img_suffix=img_suffix,
+            seg_map_suffix=seg_map_suffix,
+            reduce_zero_label=reduce_zero_label,
+            **kwargs)
