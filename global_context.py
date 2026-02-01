@@ -12,9 +12,11 @@ class GlobalContextModulator(nn.Module):
                  device='cuda', 
                  prototype_path="weights/inria_prototypes.pkl",
                  dinov3_path="weights/dinov3/model.safetensors",
-                 co_occurrence_path="data/co_occurrence_inria.json"):
+                 co_occurrence_path="data/co_occurrence_inria.json",
+                 temperature=0.1):
         super().__init__()
         self.device = device
+        self.temperature = temperature
         
         # 1. 加载 DINOv3
         self.dino_model = load_local_dinov3(dinov3_path, device=device)
@@ -41,9 +43,12 @@ class GlobalContextModulator(nn.Module):
         else:
             self.co_occurrence = {}
 
-    def get_global_prior(self, image_pil, class_names):
+    def get_global_prior(self, image_pil, class_names, return_scene_info=False):
         if self.prototypes is None or not self.co_occurrence:
-            return {c: 1.0 for c in class_names}, None
+            priors = {c: 1.0 for c in class_names}
+            if return_scene_info:
+                return priors, None, None
+            return priors, None
 
         # 1. 提取特征
         img_tensor = self.transform(image_pil).unsqueeze(0).to(self.device)
@@ -57,7 +62,7 @@ class GlobalContextModulator(nn.Module):
         sims = torch.mm(global_feat, self.prototypes.t())
         
         # 使用 Softmax 将相似度转化为权重 (Temperature=0.1 让分布稍微尖锐一点，但保留次优解)
-        weights = F.softmax(sims / 0.1, dim=1).squeeze(0) # [5]
+        weights = F.softmax(sims / self.temperature, dim=1).squeeze(0)
         
         priors = {}
         for c in class_names:
@@ -71,5 +76,15 @@ class GlobalContextModulator(nn.Module):
                 weighted_factor += factor * weights[i].item()
             
             priors[c] = weighted_factor
-            
-        return priors, global_feat
+
+        if not return_scene_info:
+            return priors, global_feat
+
+        eps = 1e-8
+        entropy = (-weights * torch.log(weights + eps)).sum()
+        scene_info = {
+            "weights": weights,
+            "entropy": entropy,
+            "num_scenes": len(self.prototypes)
+        }
+        return priors, global_feat, scene_info
